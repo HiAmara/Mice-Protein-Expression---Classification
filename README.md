@@ -34,7 +34,7 @@ Link to the dataset: [Mice Protein Expression&](https://archive.ics.uci.edu/data
 
 <div style="display: flex; justify-content: space-around;">
   <img src="Graphs/Example Proteins Density and QQ Plot" alt="Image 4" style="width: 25%;">
-  <img src="Graphs/Espression Profiles of the top ten predictor proteins" alt="Image 5" style="width: 25%;">
+  <img src="Graphs/ROC curves of final classifiers.png" alt="Image 5" style="width: 25%;">
 </div>
 
 
