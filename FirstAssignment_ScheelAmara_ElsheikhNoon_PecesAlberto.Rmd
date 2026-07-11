@@ -1,0 +1,1366 @@
+---
+title: "Mice Protein Expression"
+subtitle: |
+  Statistical Learning |
+  Master in Statistics for Data Science
+author: 
+- "Amara Scheel"
+- "Noon Elsheikh"
+- "Alberto Peces Contreras"
+date: "2026-21-02"
+output: 
+  pdf_document:
+    number_sections: true
+    toc: true
+geometry: margin=2cm
+header-includes:
+  - \usepackage{float}
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.pos = 'H')
+```
+
+\newpage
+
+# Introduction
+
+## Data description
+
+**Research Context:** This project is based on the research article
+*"Self-Organizing Feature Maps Identify Proteins Critical to Learning in
+a Mouse Model of Down Syndrome."*
+
+**Dataset Source:** [UCI Machine Learning Repository: Mice Protein
+Expression](https://doi.org/10.24432/C50S3Z)
+
+**Biological Background:** Down syndrome (DS) is a chromosomal
+abnormality (trisomy of human chromosome 21) associated with
+intellectual disability. The overexpression of genes encoded by the
+extra chromosome is believed to perturb standard pathways, causing
+learning deficits.
+
+**Goal:** We design a strategy based on probabilistic
+classifiers—Gaussian Naive Bayes (GNB), Linear Discriminant Analysis
+(LDA), and Quadratic Discriminant Analysis (QDA)—to identify
+biologically important differences in protein expression levels in mice.
+
+We include Logistic Regression as a discriminative baseline model. While
+LDA/QDA model the joint distribution of the predictors (generative),
+Logistic Regression directly models the posterior probabilities,
+providing a robust, assumption-light benchmark against which to evaluate
+our Gaussian models.
+
+**Structure:** The dataset comprises expression levels of 77 proteins
+measured across 1007 tissue samples. The samples are divided into two
+main Genotypes:
+
+-   **Control:** Normal genotype mice.
+
+-   **Ts65Dn:** Trisomic (Down Syndrome) mice.
+
+Additional factors include Treatment (Saline vs. Memantine) and Behavior
+(Stimulated vs. Not Stimulated). For this midterm project, our primary
+target variable is the **Genotype** (*Control* vs. *Ts65Dn*).
+
+# Data Preparation
+
+## Auxiliary tools
+
+We define helper functions to automate repetitive tasks: `checkNA` for
+visualizing missing data, `imputation` for filling missing values, and
+`SelectKBest` for filtering features using ANOVA.
+
+-   `checkNA`: It was built for analyzing and visualizing missing data.
+    It calculates the proportion of missing values for every column in
+    the dataset. It generates a bar plot showing the proportion of
+    missingness per feature.
+
+-   `SelectKBest`: It performs feature selection to find the most
+    relevant variables. It runs an ANOVA test for every feature `x`
+    against a target variable `y`.
+
+-   `get_group_medians`: It calculates specific, subgroup-level medians.
+    Instead of calculating a single global median for a column, it
+    groups the data by `Genotype` and `Treatment`.
+
+-   `impute_with_medians`: It performs imputation using subgroup
+    medians. It looks for missing values in the specified
+    `proteins`columns, and replaces them.
+
+```{r auxiliary_tools, echo=FALSE}
+checkNA <- function(data){
+  # For every column, we count the number of NA
+  na_counts = colSums(is.na(data))
+  
+  # Default return if no NAs
+  if(sum(na_counts) == 0) {
+    return(character(0))
+  }
+
+  # Compute (Nº columns with NA) / (Nº columns)
+  if (sum(na_counts > 0) > 0){
+    p = round(length(names(na_counts[na_counts > 0])) / ncol(data), 2)
+    na_prop = sort(na_counts[na_counts > 0] / nrow(data), decreasing = TRUE)
+  } else {
+    p = 0
+    na_prop = numeric(0)
+  }
+
+  # BARPLOT (Only plot if there are actually NAs to show)
+  if(length(na_prop) > 0) {
+      barplot(na_prop,las = 2, cex.names = 0.6, ylab = "Proportion of NA values",
+              main = "Missing-value proportion across features", col = "gray")
+      abline(h = 0.05, col = "red", lty = 2)
+      legend("topright", 
+             legend = c(paste0("Features with NA values: ", p*100, "%"),
+                                              "Threshold for high missingness"),
+             col = c("gray","red"), pch = c(15, NA), lty = c(NA, 2), bty = "n")
+      grid()
+  }
+  
+  # Return names of columns with > 5% missing data
+  return (names(na_prop[na_prop > 0.05]))
+}
+
+SelectKBest <- function(X, y, K = 10){
+  # Define auxiliary parameters
+  n_features = ncol(X)
+  f_score = numeric(n_features)
+  names(f_score) = colnames(X)
+  
+  # For each feature, we compute ANOVA test between groups
+  for (j in 1:n_features){
+    # Safe extraction of F-value to prevent crash
+    tryCatch({
+      fit <- aov(X[,j] ~ y)
+      summ <- summary(fit)
+      if(!is.null(summ[[1]][["F value"]])) {
+         f_score[j] = summ[[1]][["F value"]][1]
+      } else {
+         f_score[j] = 0 
+      }
+    }, error = function(e) { f_score[j] = 0 })
+  }
+  # We sort the F scores in decreasing order and select the best K features
+  K = min(K, n_features)
+  top_K = names(sort(f_score, decreasing = TRUE))[1:K]
+  return (top_K)
+}
+
+# Compute subgroup medians from sepecific set and columns
+get_group_medians <- function(df, proteins) {
+  df %>%
+    group_by(Genotype, Treatment) %>%
+    summarise(across(all_of(proteins),
+              \(x) median(x, na.rm = TRUE)), .groups = "drop")
+}
+
+# Impute using pre-computed medians
+impute_with_medians <- function(df, medians, proteins) {
+  for (col in proteins) {
+    na_idx <- which(is.na(df[[col]]))
+    for (i in na_idx) {
+      ref_val <- medians %>%
+        filter(Genotype  == df$Genotype[i],
+               Treatment == df$Treatment[i]) %>%
+        pull(col)
+      df[[col]][i] <- ref_val
+    }
+  }
+  return(df)
+}
+```
+
+## Packages
+
+```{r packages}
+library(tidyverse)
+library(knitr) # For tables
+library(ggplot2)
+library(patchwork)
+library(caret)
+library(class)
+library(pROC)
+library(e1071) # For Naive Bayes
+library(MASS)  # For LDA/QDA
+library(klaR)  # Additional tools
+```
+
+## Data Loading & Imputation
+
+The first step is to identify missing values. When handling missing
+data, it is important to consider the underlying mechanism: Missing
+Completely at Random (MCAR), Missing at Random (MAR), or Missing Not at
+Random (MNAR).
+
+In proteomic datasets, high rates of missingness are frequently MNAR,
+occurring when protein expression is too low for detection. Applying
+median imputation to MNAR data would artificially inflate the unobserved
+low values up to the group median, creating systemic bias.
+
+To mitigate this risk, we adopt a threshold:
+
+-   **Removal (\>5% missingness):** Features with a high proportion of
+    missing data are assumed to carry a high risk of being MNAR and are
+    excluded entirely from subsequent analyses to prevent
+    imputation-induced bias.
+
+-   **Imputation (\<5% missingness):** For variables with minimal
+    missingness, we assume the absence is largely due to technical noise
+    or measurement error (MCAR/MAR). To preserve these features without
+    dropping valuable patient rows, we apply median imputation.
+
+```{r data prep, echo = FALSE, fig.width=7, fig.height=4, width.out="100%", fig.align="center"}
+# ---------
+# Load data
+# ---------
+#!!! seperator may be ; or , depending on the dataset !!!
+data = read.csv("Data_Cortex_Nuclear.csv", sep = ",", header = TRUE)
+colNames = colnames(data)
+# ----------------
+# Different labels
+# ----------------
+metadata = c("MouseID", "Genotype", "Treatment", "Behavior", "class")
+# ----------------------------------------
+# Missing-value proportion across features
+# ----------------------------------------
+cols_with_NA = checkNA(data)
+proteins = colNames[!(colNames %in% c(metadata, cols_with_NA))]
+```
+
+**Imputation Strategy:** To prevent data leakage, we first perform a
+stratified 70/30 train/test split before any imputation takes place. We
+then divide the training set into 4 biological subgroups (Control/Ts65Dn
+× Memantine/Saline) and compute the median protein expression within
+each group exclusively from the training data. These medians are
+subsequently applied to impute missing values in both the training and
+test sets.
+
+This ensures two things: first, that the characteristics of treated mice
+do not artificially influence control mice imputation values; and
+second, that the test set is imputed using only information available at
+training time, faithfully simulating a real deployment scenario where
+new observations arrive without known labels.
+
+```{r mean value imputation, echo = FALSE}
+set.seed(619)
+# --------------------------
+# 1. Split BEFORE imputation
+# --------------------------
+lvls    <- c("Control", "Ts65Dn")
+classes <- factor(data$Genotype, levels = lvls)
+
+fltr_cols  <- !(colNames %in% cols_with_NA)
+data_clean <- data[, fltr_cols]
+
+idx_train  <- createDataPartition(classes, p = 0.7, list = FALSE)
+data_train <- data_clean[idx_train, ]
+data_test  <- data_clean[-idx_train, ]
+
+# -------------------------------------------------------------------------
+# 2. Compute subgroup medians from TRAINING SET only and perform imputation
+# -------------------------------------------------------------------------
+train_medians <- get_group_medians(data_train, proteins)
+data_train <- impute_with_medians(data_train, train_medians, proteins)
+data_test  <- impute_with_medians(data_test,  train_medians, proteins)
+
+# ---------------------------------------------------------------------------
+# 3. Reconstruct data_filtered to preserve compatibility with downstream code
+# ---------------------------------------------------------------------------
+data_filtered <- rbind(data_train, data_test)
+
+# -----------------------
+# 4. Verify no NAs remain and extract X_train/X_test
+# -----------------------
+cols_for_removal <- checkNA(data_filtered)
+X_train <- data_train[, proteins]
+X_test  <- data_test[, proteins]
+```
+
+## Multicollinearity
+
+LDA and QDA require invertible covariance matrices; high
+multicollinearity renders these singular or unstable. We empirically
+determined that thresholds above 0.70 caused QDA to fail due to
+ill-conditioned class covariance matrices, so we fix our cutoff at 0.70.
+Features are removed using `findCorrelation` from `caret`, which
+iteratively drops only the single most correlated variable from each
+pair, preserving maximum predictive information.
+
+```{r, multicollinearity handling, echo = FALSE, fig.width=6, fig.height=3.5, width.out="100%", fig.align="center"}
+# --------------------------
+# Compute correlation matrix
+# --------------------------
+cor_mat <- cor(data_filtered[,proteins])
+cor_df <- as.data.frame(as.table(cor_mat))
+colnames(cor_df) <- c("X1", "X2", "Correlation")
+# ------------
+# Heatmap plot
+# ------------
+ggplot(cor_df, aes(x = X1, y = X2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  ggtitle("Heatmap of Correlation across Features")
+```
+
+```{r correlation, echo = FALSE, fig.width=5.5, fig.height=4, width.out="100%", fig.align="center"}
+# Identify correlated features to remove (>0.7)
+
+# We use caret::findCorrelation which removes only ONE 
+# feature from a highly correlated pair (the one with the highest 
+# average correlation to all other features).
+
+cut_off = round(seq(0.0, 1.0, length.out = 25), 2)
+num_features = numeric(length(cut_off))
+
+# Visualize impact of thresholds
+for (i in seq_along(cut_off)){
+  # Find how many features would be removed at each cutoff
+  to_remove = findCorrelation(cor_mat, cutoff = cut_off[i])
+  num_features[i] = length(to_remove)
+}
+
+# Apply the chosen 0.70 threshold
+high_cor_idx = findCorrelation(cor_mat, cutoff = 0.7, names = TRUE)
+n_high_cor = length(high_cor_idx)
+
+
+# Select uncorrelated proteins
+# Remove the identified highly correlated features from our protein list
+if(length(high_cor_idx) > 0) {
+    proteins = colNames[!(colNames %in% c(metadata, cols_with_NA, high_cor_idx))]
+} else {
+    proteins = colNames[!(colNames %in% c(metadata, cols_with_NA))]
+}
+
+# Plot: Number of variables removed vs. cut-off
+plot(cut_off, num_features, type = "b", pch = 19, col = "blue",
+     xlab = "Correlation Cut-off", ylab = "Number of features removed",
+     main = "Features Removed vs. Correlation Cut-off")
+abline(v = 0.7, col = "red", lty = 2)
+grid()
+legend("topright", legend = paste("Cutoff = 0.7\nRemoved =", n_high_cor), 
+       col = "red", lty = 2, cex = 0.8, bty = "n")
+```
+
+# Exploratory Data Analysis (EDA)
+
+Before modeling, we must thoroughly investigate the dataset's target
+distribution, the underlying shapes of the feature distributions (as our
+chosen probabilistic models heavily rely on normality assumptions), and
+the multivariate expression profiles across classes.
+
+## Class Imbalance Assessment
+
+First, we examine the distribution of our target variable, `Genotype`.
+Significant class imbalance can skew model training and render standard
+accuracy metrics misleading.
+
+```{r class_balance, echo = FALSE, fig.height=2.5, fig.width=5, fig.align="center"}
+# Calculate proportions
+class_counts <- table(data_filtered$Genotype)
+class_props <- prop.table(class_counts)
+
+ggplot(data_filtered, aes(x = Genotype, fill = Genotype)) +
+  geom_bar(alpha = 0.8, color = "black", width = 0.5) + 
+  geom_text(stat = "count", aes(label = ..count..), hjust = -0.1) +
+  theme_minimal() +
+  labs(title = "Target Variable Distribution: Genotype",
+       y = "Count", x = "") +
+  scale_fill_brewer(palette = "Set1") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme(legend.position = "none") +
+  coord_flip()
+
+class_props_df <- data.frame(
+  Genotype = names(class_props),
+  Proportion = round(as.numeric(class_props), 3)
+)
+
+kable(class_props_df, caption = "Class distribution")
+```
+
+**Interpretation:** The bars for Control and Ts65Dn are roughly the same
+height. This means Accuracy is a reliable metric, and the model has
+enough examples of both classes to learn fairly.
+
+## Feature Distribution and Normality Assumption
+
+GNB, LDA, and QDA inherently assume that the continuous features follow
+a Gaussian (Normal) distribution within each class. To validate this
+assumption, we identify the single most discriminative protein using an
+ANOVA F-test and examine its distribution via Density and Q-Q
+(Quantile-Quantile) plots.
+
+```{r normality, echo = FALSE, fig.height=3.25, fig.width=7, fig.align="center"}
+
+# 1. Use SelectKBest to find the #1 best feature
+top_feature_name <- SelectKBest(data_filtered[, proteins], data_filtered$Genotype, K = 1)
+
+# 2. Density Plot
+p1 <- ggplot(data_filtered, aes(x = .data[[top_feature_name]], fill = Genotype)) +
+  geom_density(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = paste("Density of", top_feature_name),
+       x = "Expression Level", y = "Density") +
+  scale_fill_brewer(palette = "Set1")
+
+# 3. Q-Q Plot
+p2 <- ggplot(data_filtered, aes(sample = .data[[top_feature_name]], color = Genotype)) +
+  stat_qq(alpha = 0.5) + stat_qq_line(color = "black", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = paste("Q-Q Plot of", top_feature_name),
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  scale_color_brewer(palette = "Set1")
+
+# Display side by side
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+**Interpretation:** The density plot shows a clear separation between
+the group means, confirming its predictive power. The Q-Q plot shows
+that the quantiles of the data generally follow the theoretical diagonal
+line of a normal distribution. While there are slight deviations in the
+extreme tails, the overall Gaussian assumption holds sufficiently well
+to proceed with LDA and QDA.
+
+## Inter-group Protein Expression
+
+To move beyond univariate analysis, we extract the top 10 most
+discriminative proteins and visualize their average expression profiles
+across the healthy and trisomic classes.
+
+```{r topten, echo = FALSE, fig.height=4, fig.width=7, fig.align="center"}
+# Get top 10 features
+top_10_features <- SelectKBest(data_filtered[, proteins], data_filtered$Genotype, K = 10)
+
+# Compute mean expression of these top 10 proteins per Genotype
+heatmap_data <- data_filtered %>%
+  group_by(Genotype) %>%
+  summarise(across(all_of(top_10_features), mean, na.rm = TRUE)) %>%
+  pivot_longer(cols = -Genotype, names_to = "Protein", values_to = "Mean_Expression")
+
+# Plot Heatmap
+ggplot(heatmap_data, aes(x = Protein, y = Genotype, fill = Mean_Expression)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = round(Mean_Expression, 3)),  # <-- prints values on tiles
+  color = "white", size = 3.5, fontface = "bold") +
+  scale_fill_viridis_c(option = "magma") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 12, face = "bold")) +
+  labs(title = "Expression Profiles of Top 10 Predictor Proteins",
+       subtitle = "Average expression levels grouped by Genotype",
+       x = "Protein", y = "", fill = "Mean Expr.")
+
+
+```
+
+```{r effectsizes, echo = FALSE, fig.height=3.5, fig.width=5, fig.align="center"}
+effect_sizes <- data_filtered %>%
+  summarise(across(all_of(top_10_features), ~ {
+    ctrl  <- .x[data_filtered$Genotype == "Control"]
+    ts    <- .x[data_filtered$Genotype == "Ts65Dn"]
+    pooled_sd <- sqrt((var(ctrl) + var(ts)) / 2)
+    (mean(ts) - mean(ctrl)) / pooled_sd   # Cohen's d
+  })) %>%
+  pivot_longer(everything(), names_to = "Protein", values_to = "Cohens_d")
+
+# cat("Effect Sizes (Cohen's d) per Protein\n")
+# print(effect_sizes %>% arrange(desc(abs(Cohens_d))), digits = 3)
+
+ggplot(effect_sizes, aes(x = reorder(Protein, abs(Cohens_d)), 
+                          y = Cohens_d, 
+                          fill = Cohens_d > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("steelblue", "tomato"),
+                    labels = c("Higher in Control", "Higher in Ts65Dn")) +
+  theme_minimal() +
+  labs(title = "Effect Size (Cohen's d) for Top 10 Proteins",
+       subtitle = "Captures meaningful difference relative to variability",
+       x = "Protein", y = "Cohen's d", fill = "Direction")
+
+kable(effect_sizes, digits = 3, caption = "Effect Sizes (Cohen's d) per Protein")
+```
+
+**Interpretation:** Among the top 10 proteins, raw mean expression
+differences between genotypes are small (typically 0.05–0.10), which is
+expected given that protein expression data is already normalized —
+small absolute differences do not mean the proteins are unimportant.
+
+Effect size analysis shows that two proteins have large effects
+($d > 0.8$, one above $d = 1.0$), meaning the difference between groups
+is larger than the natural variation within groups which is a strong
+signal. Four proteins show medium effects ($d = 0.5$), and the remaining
+three are weaker at $d = 0.3$. Overall, classification appears to be
+driven by a small set of highly discriminant proteins, with the rest
+providing supporting information.
+
+## PCA
+
+Finally, we perform Principal Component Analysis (PCA) on the test set to evaluate global class separability in lower dimensions.
+
+```{r PCA, echo = FALSE, fig.height=4.5, fig.width=6, fig.align="center"}
+# Compute PCA on the protein data
+pca_res <- prcomp(data_train[, proteins], scale. = TRUE)
+pca_df <- as.data.frame(pca_res$x)
+pca_df$Class <- data_train$Genotype
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Class)) +
+  geom_point(alpha = 0.6, size = 2) +
+  stat_ellipse(level = 0.95, linetype = 2) + 
+  theme_minimal() +
+  labs(title = "PCA: First Two Principal Components",
+       subtitle = "Visualizing Class Separation",
+       x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100, 1), "%)"),
+       y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100, 1), "%)")) +
+  scale_color_brewer(palette = "Set1")
+```
+
+**Interpretation of PCA:** The first two principal components explain
+approximately 36% of the total variance. The visualization shows a
+significant overlap between the *Control* and *Ts65Dn* classes,
+indicating that they are not linearly separable in these lower
+dimensions.
+
+```{r scree plot, echo = FALSE, fig.height=4, fig.width=6, fig.align="center"}
+# Cumulative variance explained
+var_explained <- summary(pca_res)$importance[3, ]  # cumulative proportion
+n_components <- which(var_explained >= 0.90)[1]    # components for 90%
+
+plot(var_explained, type = "b", pch = 19, col = "blue",
+     xlab = "Number of Principal Components",
+     ylab = "Cumulative Variance Explained",
+     main = "Scree Plot: Cumulative Variance Explained")
+abline(h = 0.90, col = "red", lty = 2)
+abline(v = n_components, col = "red", lty = 2)
+grid()
+
+n_80 <- which(var_explained >= 0.80)[1]    # components for 80%
+n_90 <- which(var_explained >= 0.90)[1]    # components for 90%
+
+# Print statements
+cat(sprintf("80%% of variance is explained by %d PCs\n", n_80))
+cat(sprintf("90%% of variance is explained by %d PCs\n", n_90))
+```
+
+**Interpretation of the Scree Plot:** The dataset is highly
+multi-dimensional, to explain 80% to 90% of the variance we require 10
+to 17 principal components, respectively. This explains the overlap in
+the 2D PCA plot and confirms that the classes are not linearly separable
+in low dimensions. It justifies our use of multivariate probabilistic
+models (LDA, QDA).
+
+# Modeling Strategy
+
+## Auxiliary tools for classifiers
+
+We define some functions for each classifier, improving the future
+pipeline structure. They all follow a similar pattern: train a model on
+a training set, make prediction on a test set, and compute accuracy as
+score.
+
+-   `LogReg_classifier`: It builds a logistic regression model using the
+    `glm()`function to predict a binary target variable `y`. If the
+    probability is greater than 0.5, it assigns the class Ts65Dn;
+    otherwise, it assigns Control.
+
+-   `GNB_classifier`: It trains a Naive Bayes model, which calculates
+    the probability of each class assuming independence and gaussianity.
+
+-   `LDA_classifier`: It builds an LDA model, where a weighted
+    covariance matrix is used for both classes.
+
+-   `QDA_classifier`: It trains a QDA model, where each class have its
+    own covariance matrix.
+
+```{r classifiers, echo = FALSE}
+# -------------------
+# Logistic Regression
+# -------------------
+LogReg_classifier <- function(df_train, df_test, y_test){
+  
+  # Build the LogReg model log(mu) = beta_0 + X1*beta_1 + ... + Xn*beta_n
+  model = glm(y ~ ., data = df_train, family = binomial(link = "logit"))
+  
+  # Compute the probability corresponding to each observation
+  probs = predict(model, newdata = df_test, type = "response")
+  
+  # Calculate the classes manually
+  y_pred = factor(ifelse(probs > 0.5, "Ts65Dn", "Control"), 
+                  levels = c("Control", "Ts65Dn"))
+  # Compute the accuracy
+  acc = mean(y_pred == y_test)
+  return(acc)
+}
+# --------------------
+# Gaussian Naive Bayes
+# --------------------
+GNB_classifier <- function(df_train, df_test, y_test){
+
+  # Build the Gaussian Naive Bayes model
+  model = naiveBayes(y ~ ., data = df_train)
+  
+  # Calculate the predicted classes
+  y_pred = predict(model, df_test, type = "class")
+  
+  # Compute the accuracy
+  acc = mean(y_pred == y_test)
+  return(acc)
+}
+# ----------------------------
+# Linear Discriminant Analysis
+# ----------------------------
+LDA_classifier <- function(df_train, df_test, y_test){
+  
+  # Build the Linear Discriminant Analysis model
+  model = lda(y ~ ., data = df_train)
+  
+  # Calculate the predicted classes
+  pred = predict(model, df_test)
+  y_pred = pred$class
+  
+  # Compute the accuracy
+  acc = mean(y_pred == y_test)
+  return(acc)
+}
+# -------------------------------
+# Quadratic Discriminant Analysis
+# -------------------------------
+QDA_classifier <- function(df_train, df_test, y_test){
+  tryCatch({
+    model = qda(y ~ ., data = df_train)
+    pred  = predict(model, df_test)
+    y_pred = pred$class
+    acc = mean(y_pred == y_test)
+    return(acc)
+  }, error = function(e){
+    message("QDA failed (rank deficiency): returning NA")
+    return(NA)
+  })
+}
+```
+
+## Feature Selection Pipeline
+
+The pipeline begins by preprocessing and feature selection to prepare
+the data for classification.
+
+**Z-score scaling**:
+
+-   From the training dataset, the mean $(\mu)$ and standard deviation
+    $(\sigma)$ of each feature are computed.
+
+-   Both the training and testing sets are then standardized using these
+    parameters.
+
+-   This ensures that all features contribute equally to the
+    classifiers, avoiding bias from features with larger magnitudes.
+
+**SelectKBest** with ANOVA:
+
+-   The pipeline selects the **top K features** that have the strongest
+    univariate relationship with the target class, based on the ANOVA
+    F-score.
+
+-   The value of `K` is defined before training and will be varied to
+    determine the optimal number of features for each classifier.
+
+**Classification**:
+
+-   Each classifier (LogReg, GNB, LDA, and QDA) is trained using only
+    the selected **top-K features**.
+
+-   The pipeline computes the **average accuracy** on the test set.
+    These accuracies are stored for later comparisons between
+    classifiers allowing us to identify the value of `K` that gives the
+    best performance.
+
+```{r pipeline_structure}
+# ------------------------------
+# Function for pipeline workflow
+# ------------------------------
+run_pipeline <- function(X_train, X_test, y_train, y_test, topk = 10){
+  
+  # 1. Extract parameters for Z-score scaling
+  mu = apply(X_train, 2, mean)
+  sigma = apply(X_train, 2, sd)
+  
+  # 2. Scale train and test partitions with TRAIN parameters
+  X_train_sc = scale(X_train, center = mu, scale = sigma)
+  X_test_sc = scale(X_test, center = mu, scale = sigma)
+  
+  # 3. Select K Best
+  topk = min(topk, ncol(X_train_sc)) # "topk" > ncol: not allowed 
+  top_k = SelectKBest(X = X_train_sc, y = y_train, K = topk)
+  
+  # 4. Select K features and turn matrix into dataframe format
+  X_train_df = data.frame(y = y_train, X_train_sc[,top_k, drop = FALSE])
+  X_test_df = data.frame(X_test_sc[,top_k, drop = FALSE])
+  
+  # 5. LogReg classification
+  acc_LogReg = LogReg_classifier(X_train_df, X_test_df, y_test)
+  
+  # 6. GNB classification
+  acc_GNB = GNB_classifier(X_train_df, X_test_df, y_test)
+  
+  # 7. LDA classification
+  acc_LDA = LDA_classifier(X_train_df, X_test_df, y_test)
+  
+  # 8. QDA classification
+  acc_QDA = QDA_classifier(X_train_df, X_test_df, y_test)
+  
+  # Results
+  return(list(LogReg=acc_LogReg,GNB=acc_GNB,LDA=acc_LDA,QDA=acc_QDA,features=top_k))
+}
+```
+
+The previous pipeline is extended to **5-Fold Cross-Validation** to
+obtain a more robust estimate of performance for each number of top
+features (`topk`).
+
+**Fold creation and initialization**:
+
+-   The dataset is split into **5 folds**, and some variables are
+    defined **to store accuracies** and the selected **feature subsets**
+    for each classifier and fold.
+
+**Training and testing per fold**
+
+-   For each fold, one subset is used as the test set, while
+    the remaining 4 folds form the training set.
+
+-   This ensures that every data point is used once for testing and 4
+    times for training. In addition, each classifier will be trained
+    using the same fold assignments **to avoid data leakage** and to
+    ensure **generalization**.
+
+**Pipeline execution and data collection**
+
+-   The previously `pipeline` (scaling, feature selection, classifier
+    training) is applied to the training and testing sets in each fold.
+
+-   **Accuracy scores** and the **selected top-K features** are recorded
+    for each classifier.
+
+-   After all folds, the **average performance** is computed to identify
+    the optimal number of features and compare classifiers.
+
+```{r kfold_cv}
+# Structure for K-Fold CV Wrapper
+kfold_cv <- function(X, y, k = 5, topk = 10){
+  folds = createFolds(y, k = k, list = TRUE, returnTrain = TRUE)
+  features_list = vector("list", k)
+  # Initialize with NA so failed folds don't count as "0% accuracy"
+  scores = matrix(NA, nrow = 4, ncol = k, 
+                  dimnames = list(c("LogReg", "GNB", "LDA", "QDA"), NULL))
+
+  for (i in seq_along(folds)){
+      idx_train = folds[[i]]
+      X_train_fold = X[idx_train,]
+      y_train_fold = y[idx_train]
+      X_test_fold = X[-idx_train,]
+      y_test_fold = y[-idx_train]
+      
+      res = run_pipeline(X_train_fold, X_test_fold, y_train_fold, y_test_fold, topk)
+      scores[, i] = c(res$LogReg, res$GNB, res$LDA, res$QDA)
+      features_list[[i]] = res$features 
+  }
+
+  # STABILITY SELECTION to avoid selection bias
+  # 1. Unlist all features chosen across the folds
+  all_selected <- unlist(features_list)
+  
+  # 2. Count the frequency of each feature
+  feature_counts <- table(all_selected)
+  
+  # 3. Sort them by most frequent to least frequent, and pick the top K
+  sorted_features <- sort(feature_counts, decreasing = TRUE)
+  final_features <- names(sorted_features)[1:topk]
+  
+  out = list(cv_scores = scores, 
+             feat_LogReg = final_features,
+             feat_GNB    = final_features,
+             feat_LDA    = final_features,
+             feat_QDA    = final_features)
+  return(out)
+}
+```
+
+This is an output example of the previous process.
+
+```{r kfold_cv_example}
+# kfold_cv(X = X_train, y = classes[idx_train], k = 5, topk = 5)
+
+# Output:
+# $cv_scores
+#             [,1]      [,2]      [,3]      [,4]      [,5]
+# LogReg 0.7800000 0.8145695 0.8211921 0.7894737 0.8026316
+# GNB    0.7800000 0.7748344 0.7947020 0.7697368 0.7697368
+# LDA    0.7800000 0.8211921 0.8211921 0.7960526 0.8026316
+# QDA    0.8066667 0.8013245 0.8410596 0.8157895 0.7894737
+# 
+# $feat_LogReg
+# [1] "APP_N"   "S6_N"    "pPKCG_N" "GluR3_N" "SYP_N"  
+# 
+# $feat_GNB
+# [1] "APP_N"   "S6_N"    "pPKCG_N" "GluR3_N" "SYP_N"  
+# 
+# $feat_LDA
+# [1] "APP_N"   "S6_N"    "GluR3_N" "pPKCG_N" "SYP_N"  
+# 
+# $feat_QDA
+# [1] "APP_N"   "S6_N"    "pPKCG_N" "GluR3_N" "SYP_N"  
+```
+
+In the following chunk, the **full pipeline** will be executed for each
+number of top features (`topk`). Performance metrics, such as
+**accuracies** and **standard deviations**, will be computed, jointly
+with the corresponding **selected feature subsets**.
+
+QDA is sensitive to **high dimensionality** and has shown **numerical
+stability issues** at the covariance matrix calculation step. Therefore,
+we decided to build an array to **track** exactly when and where these
+**failures** occur during cross-validation. As we iteratively increase
+the number of features, we record the number of folds in which QDA model
+fails to "converge". This information is then used to generate a
+diagnostic plot, showing the dimensionality at which the model stability
+breaks down.
+
+```{r kfold_cv_pipeline}
+set.seed(619) 
+
+max_feats = min(30, length(proteins)) # Define the number of features
+
+qda_stability <- numeric(max_feats) # Initialize vector to track qda failures
+
+# Define the result containers (mean, sd, best_feats) for each classifier
+mean_acc = matrix(0, nrow = 4, ncol = max_feats, 
+                  dimnames = list(c("LogReg", "GNB", "LDA", "QDA"), NULL))
+
+sd_acc = matrix(0, nrow = 4, ncol = max_feats,
+                dimnames = list(c("LogReg","GNB","LDA","QDA"), NULL))
+
+best_feats = list(LogReg = vector("list", max_feats), 
+                  GNB = vector("list", max_feats),
+                  LDA = vector("list", max_feats),
+                  QDA = vector("list", max_feats))
+
+# Run the K-Fold CV pipeline in a loop ---> 1:max_features
+for (i in 1:max_feats){
+  # 5-Fold CV
+  kfold_result = kfold_cv(X = X_train, y = classes[idx_train], k = 5, topk = i)
+  # Check the number of folds where QDA is failing
+  qda_stability[i] <- sum(is.na(kfold_result$cv_scores["QDA", ]))
+  # Save 
+  mean_acc[, i] = rowMeans(kfold_result$cv_scores, na.rm = TRUE)
+  sd_acc[, i]   = apply(kfold_result$cv_scores, 1, sd, na.rm = TRUE)
+  
+  best_feats$LogReg[[i]] = kfold_result$feat_LogReg
+  best_feats$GNB[[i]]    = kfold_result$feat_GNB
+  best_feats$LDA[[i]]    = kfold_result$feat_LDA
+  best_feats$QDA[[i]]    = kfold_result$feat_QDA
+}
+```
+
+We monitored the numerical stability of QDA, which exhibited significant
+rank deficiency as the number of features increased. Specifically, at
+feature counts above 15, QDA failed to converge in multiple folds. Our
+suggestion for QDA is to select as 'Optimal K' approx. 10–13 features,
+ensuring that we operate within the 'Stability Zone' of the QDA
+algorithm.
+
+```{r, echo = FALSE, fig.height=4.5, fig.width=6, fig.align="center"}
+# ----------------------
+# QDA stability checking
+# ----------------------
+first_fail <- which(qda_stability > 0)[1] # First failure for the vertical line
+
+plot(1:max_feats, qda_stability, type = "s", col = "red", lwd = 2,
+     xlab = "Number of Features (top-k)", ylab = "Folds Failed (out of 5)",
+     main = "QDA Mathematical Stability Limit")
+grid()
+
+if(!is.na(first_fail)) {
+  abline(v = first_fail - 0.5, col = "darkgreen", lty = 2)
+  text(first_fail/2, 4.5, "Stable Zone", col = "darkgreen", font = 2)
+  text(first_fail + (max_feats-first_fail)/2, 4.5, "Failure Zone", col = "red", font = 2)
+}
+```
+
+The behavior of the classifiers for different feature subsets is shown
+in graphs. Each classifier was trained using the same folds to avoid
+data leakage. The mean and standard deviation across the 5-Folds are
+computed as performance metrics for each feature subset.
+
+Average accuracy is plotted against the number of selected features. We
+use a 2x2 grid, with one graph per classifier, to visualize the general
+performance from the first to the maximum number of features. The upper
+and lower bounds represent the standard deviation across the 5-Folds,
+allowing us to observe the performance variability.
+
+To select the optimal number of features, we estimate the **elbow
+point** as the point that maximizes the orthogonal distance to the
+straight line connecting the first and last values of the curve. This
+procedure is applied to the GNB, LDA, and LogReg classifiers to ensure
+methodological consistency. However, for QDA, the preferred approach is
+to select an intermediate value between 10 and 13 features, as discussed
+previously.
+
+```{r, echo = FALSE}
+# The code is defined as the point which maximizes the orthogonal distance 
+# to the straight line that connects the first and last value of the curve.
+get_elbow_point <- function(m){
+  n = length(m)
+  x = 1:n
+  # Starting point: (x1,y1)
+  x1 = 1
+  y1 = m[1]
+  # Ending point: (x2, y2)
+  x2 = n
+  y2 = m[n]
+  # Straight line coefficients
+  a = y2-y1
+  b = x1-x2
+  c = x2*y1 - x1*y2
+  # Orthogonal distance
+  dist = abs(a*x + b*m + c) / sqrt(a^2 + b^2)
+  return(which.max(dist))# elbow point position
+}
+
+plot_elbow_curve <- function(max_feats, m, s, main_title) {
+  
+  elbow_idx = get_elbow_point(m)# Get elbow point position
+  
+  y_min <- min(m - s, na.rm = TRUE) # axis-y lim
+  y_max <- 1.0 # axis-y lim
+  
+  # Plot the Accuracy vs Top-K Features
+  plot(1:max_feats, m, type = "b", pch = 19, col = "blue",
+       xlab = "Number of top features", ylab = "Mean CV Accuracy",
+       main = main_title, ylim = c(y_min - 0.05, y_max + 0.05))
+  # Plot standard deviation bounds
+  lines(1:max_feats, m + s, lty = 2, col = "gray40")
+  lines(1:max_feats, m - s, lty = 2, col = "gray40")
+  
+  # Plot the straight line between first and last point
+  segments(x0 = 1, y0 = m[1], x1 = max_feats, y1 = m[max_feats], 
+           col = "darkgreen", lty = 2, lwd = 2)
+  
+  points(elbow_idx, m[elbow_idx], col = "purple", pch = 19, cex = 1.5)
+  
+  legend("bottomright", 
+         legend = c(expression(mu), expression(mu %+-% sigma), "Secant", "Elbow"),
+         col = c("blue", "gray40", "darkgreen", "purple"),
+         lty = c(1, 2, 2, 1), 
+         pch = c(19, NA, NA, 19), 
+         bty = "n", cex = 0.95)
+  grid()
+}
+```
+
+```{r accuracy_classifiers, echo = FALSE, fig.width=10, fig.height=8, out.width="100%"}
+# Minimum value
+y_min = min(mean_acc[c("LogReg","GNB","LDA","QDA"), ], na.rm = TRUE)
+# Margins for plots
+par(mfrow = c(2,2), mar = c(4, 4, 2.5, 1))
+# -------------------
+# Logistic Regression
+# -------------------
+m = mean_acc["LogReg",] # average value
+s = sd_acc["LogReg",] # standard deviation
+plot_elbow_curve(max_feats, m, s, "LogReg: Accuracy vs Top-K Features")
+# --------------------
+# Gaussian Naive Bayes
+# --------------------
+m = mean_acc["GNB",] # average value
+s = sd_acc["GNB",] # standard deviation
+plot_elbow_curve(max_feats, m, s, "GNB: Accuracy vs Top-K Features")
+# ----------------------------
+# Linear Discriminant Analysis
+# ----------------------------
+m = mean_acc["LDA",] # average value
+s = sd_acc["LDA",] # standard deviation
+plot_elbow_curve(max_feats, m, s, "LDA: Accuracy vs Top-K Features")
+# -------------------------------
+# Quadratic Discriminant Analysis
+# -------------------------------
+m = mean_acc["QDA",] # average value
+s = sd_acc["QDA",] # standard deviation
+plot(1:max_feats, mean_acc["QDA",], type = "b", pch = 19, col = "blue",
+     xlab = "Number of top features", ylab = "Mean CV Accuracy",
+     main = "QDA: Accuracy vs Top-K Features", ylim=c(y_min-0.1, 1.0))
+lines(1:max_feats, m + s, lty=2, col="gray40") # up sigma
+lines(1:max_feats, m - s, lty=2, col="gray40") # down sigma
+segments(x0 = 11, y0 = 0, x1 = 11, y1 = m[11], 
+         col = "purple", lty = 2, lwd = 2)
+points(11, m[11], col = "purple", pch = 19, cex = 1.5)
+legend("bottomright", legend = c(expression(mu), expression(mu %+-% sigma),"Elbow"),
+       col=c("blue","gray40","purple"),lty=c(1,2,3),pch=c(19, NA, 17),
+       bty="n",cex=1.1)
+grid()
+```
+
+**Observations**:
+
+LogReg (`k=14`) and LDA (`k=12`) show similar behavior, with a positive
+trend that stabilizes as the number of features increases. In contrast,
+GNB (`k=15`) exhibits a nearly constant trend across all number of top
+features, and displays the largest variability, as shown by the wider
+standard deviation bands.
+
+QDA (`k=11`) exhibits a positive trend with narrower standard deviation
+bands, but as explained in the previous plot, it has stability issues
+beyond 15 features due to the high dimensionality. After this point,
+some folds fail, and the results become unreliable. We selected the
+elbow point based on the recommendation previously discussed.
+
+## Model Training
+
+Based on the trends observed in the accuracy curves and the variability
+of each classifier, we determined an appropriate number of top features
+for training. For each classifier, the 'Optimal K' was chosen based on
+the elbow point of the cross-validation accuracies, while considering
+the stability limitations of QDA too. Following Occam's razor, we will
+prefer simpler models to improve interpretability and computational
+efficiency, while avoiding issues such as rank deficiency in covariance
+matrices.
+
+```{r scale_training}
+# Extract standardization parameters and scale data
+mu = colMeans(X_train)
+sigma = apply(X_train, 2 , sd)
+X_train_sc = scale(X_train, center = mu, scale = sigma)
+X_test_sc = scale(X_test, center = mu, scale = sigma)
+# Define labels for testing set
+y_test = classes[-idx_train]
+```
+
+```{r logreg}
+optimal_k = 14
+# 1. Logistic Regression
+best_k_LogReg = best_feats$LogReg[[optimal_k]]
+
+# 1.1. Build dataframes
+df_train_LogReg = data.frame(X_train_sc[, best_k_LogReg],class = classes[idx_train])
+df_test_LogReg  = data.frame(X_test_sc[, best_k_LogReg])
+
+# 1.2. Build model and predict df_test
+logreg_model = glm(class ~ ., data = df_train_LogReg, 
+                   family = binomial(link = "logit"))
+logreg_probs = predict(logreg_model, newdata = df_test_LogReg, type = "response")
+logreg_class = factor(ifelse(logreg_probs > 0.5, "Ts65Dn", "Control"),levels = lvls)
+```
+
+```{r GNB}
+optimal_k = 15
+# 2. Gaussian Naive Bayes
+best_k_GNB = best_feats$GNB[[optimal_k]]
+
+# 2.1. Build dataframes
+df_train_GNB = data.frame(X_train_sc[, best_k_GNB], class = classes[idx_train])
+df_test_GNB  = data.frame(X_test_sc[, best_k_GNB])
+
+# 2.2. Build model and predict df_test
+gnb_model = naiveBayes(class ~ ., data = df_train_GNB)
+gnb_probs = predict(gnb_model, df_test_GNB, type = "raw")
+gnb_class = predict(gnb_model, df_test_GNB, type = "class")
+```
+
+```{r LDA}
+optimal_k = 12
+# 3. LDA
+best_k_LDA = best_feats$LDA[[optimal_k]]
+
+# 3.1. Build dataframes
+df_train_LDA = data.frame(X_train_sc[, best_k_LDA], class = classes[idx_train])
+df_test_LDA  = data.frame(X_test_sc[, best_k_LDA])
+
+# 3.2. Build model and predict df_test
+lda_model = lda(class ~ ., data = df_train_LDA)
+lda_pred = predict(lda_model, df_test_LDA)
+lda_probs = lda_pred$posterior
+lda_class = lda_pred$class
+```
+
+```{r QDA}
+optimal_k = 11
+# 4. QDA
+best_k_QDA = best_feats$QDA[[optimal_k]]
+
+# 4.1. Build dataframes
+df_train_QDA = data.frame(X_train_sc[, best_k_QDA], class = classes[idx_train])
+df_test_QDA  = data.frame(X_test_sc[, best_k_QDA])
+
+# 4.2. Build model and predict df_test
+qda_model = qda(class ~ ., data = df_train_QDA)
+qda_pred = predict(qda_model, df_test_QDA)
+qda_probs = qda_pred$posterior
+qda_class = qda_pred$class
+```
+
+# Results & Evaluation
+
+## Robust Cross-Validation
+
+Single train/test splits can be noisy. To get a robust estimate of
+performance, we perform **Stratified 10-Fold Cross-Validation** on all
+four models.
+
+```{r robust cross validation, fig.width=10, fig.height=5, out.width="100%"}
+set.seed(619);
+# Define Control
+train_control <- trainControl(method = "cv", number = 10, 
+                              classProbs = TRUE, summaryFunction = twoClassSummary)
+# Train Models using Caret
+cv_logreg <- train(class ~ ., data = df_train_LogReg, method = "glm", 
+                   family = "binomial", metric = "ROC", trControl = train_control)
+
+cv_lda <- train(class ~ ., data = df_train_LDA, method = "lda", 
+                metric = "ROC", trControl = train_control)
+
+cv_qda <- train(class ~ ., data = df_train_QDA, method = "qda", 
+                metric = "ROC", trControl = train_control)
+
+cv_nb <- train(class ~ ., data = df_train_GNB, method = "nb", 
+               metric = "ROC", trControl = train_control)
+
+# Compile & Visualize
+cv_results <- resamples(list(LogReg = cv_logreg, 
+                             LDA = cv_lda, 
+                             QDA = cv_qda, 
+                             NaiveBayes = cv_nb))
+
+dotplot(cv_results, main = "10-Fold CV Performance (ROC/AUC)")
+```
+
+**Observation**: GNB exhibits the worst performance compared to the
+other models. This is expected because GNB assumes that the expression
+level of each protein is independent of the others. In a real biological
+system, this assumption is not entirely accurate, as proteins interact
+within pathways and networks. The results indicate that the relationship
+between features are more complex than the model assumes.
+
+## Model Comparison (Test Set)
+
+In our analysis, the target variable was encoded such that trisomic
+genotype (Ts65Dn) represents the positive class (`lvl=1`) and the normal
+genotype (Control) represents the negative class (`lvl=2`). Therefore,
+in this scenario, **sensitivity** measures the ability of the model to
+correctly classify Ts65Dn, while **specificity** measures its accuracy
+in identifying Control.
+
+We compare the models based on Accuracy, Sensitivity (Recall), and
+Specificity on the hold-out test set.
+
+```{r model comparison, echo = FALSE}
+LogReg_cm = confusionMatrix(logreg_class, y_test, positive = "Ts65Dn")
+GNB_cm = confusionMatrix(gnb_class, y_test, positive = "Ts65Dn")
+LDA_cm = confusionMatrix(lda_class, y_test, positive = "Ts65Dn")
+QDA_cm = confusionMatrix(qda_class, y_test, positive = "Ts65Dn")
+
+comparison <- data.frame(
+  Method = c("Logistic Regression", "LDA", "QDA", "Naive Bayes"),
+  Accuracy = c(LogReg_cm$overall["Accuracy"], 
+               LDA_cm$overall["Accuracy"], 
+               QDA_cm$overall["Accuracy"], 
+               GNB_cm$overall["Accuracy"]),
+  Sensitivity = c(LogReg_cm$byClass["Sensitivity"], 
+                  LDA_cm$byClass["Sensitivity"], 
+                  QDA_cm$byClass["Sensitivity"], 
+                  GNB_cm$byClass["Sensitivity"]),
+  Specificity = c(LogReg_cm$byClass["Specificity"], 
+                  LDA_cm$byClass["Specificity"], 
+                  QDA_cm$byClass["Specificity"], 
+                  GNB_cm$byClass["Specificity"])
+)
+```
+
+```{r visualize comparison, echo = FALSE, fig.height=3.25, fig.width=6}
+comparison_long <- comparison %>% pivot_longer(cols = -Method, 
+                                               names_to = "Metric", 
+                                               values_to = "Value")
+
+ggplot(comparison_long, aes(x = Method, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Performance Comparison of Probabilistic Classifiers", 
+       y = "Value", x = "") +
+  theme_minimal() + 
+  scale_fill_brewer(palette = "Set2") + 
+  coord_flip() + 
+  theme(legend.position = "bottom")
+```
+
+```{r, echo = FALSE}
+knitr::kable(comparison, digits = 4, caption = "Performance Comparison")
+```
+
+**Interpretation:**
+
+When observing the results from the probabilistic and discriminative
+classifiers on the expression levels of the selected proteins, the
+models LogReg, LDA, and QDA each offer **different advantages**
+depending on the specific context of the study.
+
+In terms of **overall predictive power**, **LDA** achieves the highest
+accuracy (0.9475) and specificity (0.9649) in the analysis. Its
+**maximum specificity** makes it the most reliable model for correctly
+identifying subjects with normal genotypes (Control). In contrast,
+**LogReg** demonstrates the most **balanced performance** across metrics
+and achieves the **highest sensitivity** (0.9346), becoming particularly
+effective at detecting the perturbed protein pathways of the Ts65Dn
+group.
+
+Finally, **QDA** achieves a highly competitive accuracy (0.9383), and
+demonstrates sensitivity (0.9281) close to that of LDA. However, this
+model is strongly affected by **multicollinearity issues**, making it
+less suitable for high-dimensional data. While QDA could be reasonable
+when working with a small subset of biomarkers, in this context its
+**mathematical complexity** becomes a disadvantage.
+
+## ROC Curves
+
+To evaluate the discriminatory capability independent of a specific
+threshold, we analyze the Receiver Operating Characteristic (ROC)
+curves. The **LogReg** (blue), **LDA** (red), and **QDA** (purple) show
+the steepest rise toward the top-left corner, confirming their high
+performance in terms of AUC and overall discriminatory power.
+
+```{r ROC, echo = FALSE, fig.height=3.25, fig.width=6, width.out = "100%", fig.align="center"}
+
+roc_logreg = roc(y_test, logreg_probs, levels = lvls, direction = "<")
+roc_lda = roc(y_test, lda_probs[, "Ts65Dn"], levels = lvls, direction = "<")
+roc_qda = roc(y_test, qda_probs[, "Ts65Dn"], levels = lvls, direction = "<")
+roc_gnb = roc(y_test, gnb_probs[, "Ts65Dn"], levels = lvls, direction = "<")
+
+roc_data <- bind_rows(data.frame(Sensitivity = roc_logreg$sensitivities, 
+                                 Specificity = roc_logreg$specificities, 
+                                 Method = "Logistic", 
+                                 AUC = as.numeric(roc_logreg$auc)),
+                      data.frame(Sensitivity = roc_lda$sensitivities, 
+                                 Specificity = roc_lda$specificities, 
+                                 Method = "LDA", 
+                                 AUC = as.numeric(roc_lda$auc)),
+                      data.frame(Sensitivity = roc_qda$sensitivities, 
+                                 Specificity = roc_qda$specificities, 
+                                 Method = "QDA", 
+                                 AUC = as.numeric(roc_qda$auc)),
+                      data.frame(Sensitivity = roc_gnb$sensitivities, 
+                                 Specificity = roc_gnb$specificities, 
+                                 Method = "Naive Bayes", 
+                                 AUC = as.numeric(roc_gnb$auc))
+)
+
+ggplot(roc_data, aes(x = 1 - Specificity, y = Sensitivity, color = Method)) +
+  geom_line(linewidth = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  labs(title = "ROC Curves", x = "False Positive Rate (1 - Specificity)", y = "Sensitivity") +
+  theme_minimal() + scale_color_brewer(palette = "Set1") + coord_equal()
+```
+
+```{r AUC}
+# Compute AUC for each model
+auc_table <- data.frame(
+  Method = c("Logistic Regression", "LDA", "QDA", "Naive Bayes"),
+  AUC = c(
+    as.numeric(auc(roc_logreg)),
+    as.numeric(auc(roc_lda)),
+    as.numeric(auc(roc_qda)),
+    as.numeric(auc(roc_gnb))
+  )
+)
+
+# Merge with existing comparison table
+comparison <- comparison %>%
+  left_join(auc_table, by = "Method") %>%
+  relocate(AUC, .after = Accuracy)
+
+knitr::kable(comparison, digits = 4, 
+             caption = "Performance Comparison (Test Set)")
+```
+
+## Threshold Exploration (Medical Context Tuning)
+
+By default, probabilistic classifiers such as LDA and LogReg use a 0.5
+decision threshold to assign class labels, assuming that False Positives
+and False Negatives have similar cost. However, in medical diagnostics,
+this default threshold is rarely optimal, as the cost of a False
+Negative (failing to identify a trisomic mouse) may differ significantly
+from a False Positive. To address this, we built a plot to study the
+effect of tuning the decision threshold on the Accuracy, Sensitivity,
+and Specificity. This visualization allows us to assess the trade-off
+between metrics beyond the default 0.5 cutoff. This tool becomes really
+useful depending on the specific requirements of the analysis.
+
+```{r, echo = FALSE}
+
+lvls <- c("Ts65Dn", "Control") # Define levels 
+thresholds <- seq(0.05, 0.95, by = 0.05) # Define threshold grid
+
+calculate_metrics <- function(probs, actual_labels) {
+  map_dfr(thresholds, function(t) {
+    
+    pred <- factor(ifelse(probs > t, "Ts65Dn", "Control"), levels = lvls)
+    cm <- confusionMatrix(pred, actual_labels, positive = "Ts65Dn")
+    data.frame(Threshold = t,
+               Accuracy = cm$overall["Accuracy"],
+               Sensitivity = cm$byClass["Sensitivity"],
+               Specificity = cm$byClass["Specificity"])
+  })
+}
+
+prob_lda = lda_probs[, "Ts65Dn"] 
+prob_logreg = logreg_probs
+
+res_lda = calculate_metrics(prob_lda, y_test)
+res_logreg = calculate_metrics(prob_logreg, y_test)
+```
+
+```{r, echo = FALSE, fig.height=4.25, fig.width=6.5, width.out = "100%", fig.align="center"}
+# Plot threshold effects
+plot_thresholds <- function(results_df, model_title) {
+  threshold_long <- results_df %>%
+    pivot_longer(cols = -Threshold, names_to = "Metric", values_to = "Value") %>%
+    drop_na()
+  
+  ggplot(threshold_long, aes(x = Threshold, y = Value, color = Metric)) +
+    geom_line(linewidth = 1) +
+    geom_point() +
+    geom_vline(xintercept = 0.5, linetype = "dashed", color = "gray50") +
+    labs(title = model_title,
+         x = "Decision Threshold", 
+         y = "Metric Value") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+    scale_color_brewer(palette = "Set2")
+}
+
+# Individual plots
+plot_lda = plot_thresholds(res_lda, "LDA")
+plot_logreg = plot_thresholds(res_logreg, "LogReg")
+
+# Concatenate both plots
+final_plot = plot_lda + plot_logreg + 
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Effect of Decision Threshold",
+    subtitle = "Dashed line shows the default 0.5 threshold",
+    theme = theme(plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+                  plot.subtitle = element_text(hjust = 0.5, size = 10))
+  ) & 
+  theme(legend.position = "bottom", legend.title = element_blank())
+
+final_plot
+```
