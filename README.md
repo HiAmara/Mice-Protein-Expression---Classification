@@ -81,7 +81,7 @@ Every model introduced in this part outperformed the best previous baselines by 
   <img src="Graphs/10-fold CV performance" alt="Image 4" style="width: 25%;">
   <img src="Graphs/Expected cost vs Classification Threshold.png.png" alt="Image 5" style="width: 25%;">
   <img src="Graphs/Learning Curve Random Forest.png" alt="Image 4" style="width: 25%;">
-  <img src="Graphs/Neural Network Training History.png" alt="Image 5" style="width: 25%;">
+  <img src="Graphs/Neural Network Training History.png" alt="Image 5" style="width: 23%;">
 </div>
 
 ## Explaining the Performance Improvement
